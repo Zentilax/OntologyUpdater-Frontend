@@ -524,24 +524,43 @@ runBtn.addEventListener('click', async () => {
   fd.append('enable_recommendations', document.getElementById('opt-rec').checked ? 'true' : 'false');
 
   try {
-    const resp = await fetch(`${BACKEND_URL}/update-ontology`, { method: 'POST', body: fd });
-    const data = await resp.json();
+    let resp, data;
 
-    if (!resp.ok || !data.success) {
-      throw new Error(data.detail || data.message || `HTTP ${resp.status}`);
+    try {
+      resp = await fetch(`${BACKEND_URL}/update-ontology`, { method: 'POST', body: fd });
+    } catch (networkErr) {
+      throw new Error(`Could not reach backend: ${networkErr.message}`);
     }
 
-    // Render backend print logs
+    // Try to parse JSON regardless of status code
+    try {
+      data = await resp.json();
+    } catch {
+      throw new Error(`Backend returned non-JSON response (HTTP ${resp.status})`);
+    }
+
+    // Always render any logs that came back (even on error responses)
     terminal.innerHTML = '';
-    (data.logs || []).forEach(line => addLog(line));
+    if (data.logs && data.logs.length > 0) {
+      data.logs.forEach(line => addLog(line));
+    }
+
+    if (!resp.ok || !data.success) {
+      const brief = data.detail || data.message || `HTTP ${resp.status}`;
+      addLog(`✗ ${brief}`, 'error');
+      throw new Error(brief);
+    }
 
     owlFilename = data.owl_filename || owlFilename;
     renderResults(data);
 
   } catch (err) {
-    errorBox.textContent = `Error: ${err.message}`;
-    errorBox.classList.add('show');
-    addLog(`Error: ${err.message}`, 'error');
+    document.getElementById('error-box').textContent = `Error: ${err.message}`;
+    document.getElementById('error-box').classList.add('show');
+    // Only add to terminal if not already logged above
+    if (!terminal.querySelector('.error')) {
+      addLog(`✗ ${err.message}`, 'error');
+    }
   } finally {
     runBtn.classList.remove('busy');
     runBtn.disabled = false;
