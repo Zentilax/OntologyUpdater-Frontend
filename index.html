@@ -441,11 +441,13 @@ h1 {
 <script>
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 // Set this to your Railway backend URL — no trailing slash
-const BACKEND_URL = "https://ontologyupdater-production.up.railway.app";
+const BACKEND_URL = "https://YOUR-APP.railway.app";
 // ─────────────────────────────────────────────────────────────────────────────
 
 let csvFile = null, owlFile = null;
 let owlFilename = "ontology_updated.owl";
+let owlChunks = [];
+let pendingResult = null;
 
 // ── Drop zones ────────────────────────────────────────────────────────────────
 function setupDrop(zoneId, inputId, ext) {
@@ -506,6 +508,8 @@ runBtn.addEventListener('click', async () => {
   errorBox.classList.remove('show');
   document.getElementById('results-card').classList.remove('show');
   terminal.innerHTML = '';
+  owlChunks = [];
+  pendingResult = null;
 
   // Show log card with waiting hint
   document.getElementById('log-card').classList.add('show');
@@ -524,43 +528,71 @@ runBtn.addEventListener('click', async () => {
   fd.append('enable_recommendations', document.getElementById('opt-rec').checked ? 'true' : 'false');
 
   try {
-    let resp, data;
-
+    let resp;
     try {
       resp = await fetch(`${BACKEND_URL}/update-ontology`, { method: 'POST', body: fd });
     } catch (networkErr) {
       throw new Error(`Could not reach backend: ${networkErr.message}`);
     }
 
-    // Try to parse JSON regardless of status code
-    try {
-      data = await resp.json();
-    } catch {
-      throw new Error(`Backend returned non-JSON response (HTTP ${resp.status})`);
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); detail = j.detail || detail; } catch {}
+      throw new Error(detail);
     }
 
-    // Always render any logs that came back (even on error responses)
-    terminal.innerHTML = '';
-    if (data.logs && data.logs.length > 0) {
-      data.logs.forEach(line => addLog(line));
-    }
+    // Read the SSE stream — each log line arrives immediately as the server yields it
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
 
-    if (!resp.ok || !data.success) {
-      const brief = data.detail || data.message || `HTTP ${resp.status}`;
-      addLog(`✗ ${brief}`, 'error');
-      throw new Error(brief);
-    }
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
 
-    owlFilename = data.owl_filename || owlFilename;
-    renderResults(data);
+      // SSE events separated by double newline
+      const parts = buf.split('\n\n');
+      buf = parts.pop(); // keep incomplete trailing chunk
+
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        let payload;
+        try { payload = JSON.parse(line.slice(5).trim()); } catch (e) {
+          addLog(`✗ SSE parse error: ${e.message}`, 'error');
+          continue;
+        }
+
+        if (payload.type === 'meta') {
+          owlFilename = payload.owl_filename || owlFilename;
+        } else if (payload.type === 'log') {
+          addLog(payload.msg);
+        } else if (payload.type === 'error') {
+          addLog(`✗ ${payload.msg}`, 'error');
+          document.getElementById('error-box').textContent = `Error: ${payload.msg}`;
+          document.getElementById('error-box').classList.add('show');
+        } else if (payload.type === 'done') {
+          // Stats + recommendations arrived — render results section (no OWL yet)
+          pendingResult = payload;
+          renderResults(payload);
+        } else if (payload.type === 'file_chunk') {
+          owlChunks.push(payload.chunk);
+          if (payload.done) {
+            // All chunks received — assemble and set download link
+            const owl_file_b64 = owlChunks.join('');
+            owlChunks = [];
+            setOwlDownload(owl_file_b64);
+            addLog('✓ OWL file ready for download', 'success');
+          }
+        }
+      }
+    }
 
   } catch (err) {
     document.getElementById('error-box').textContent = `Error: ${err.message}`;
     document.getElementById('error-box').classList.add('show');
-    // Only add to terminal if not already logged above
-    if (!terminal.querySelector('.error')) {
-      addLog(`✗ ${err.message}`, 'error');
-    }
+    addLog(`✗ ${err.message}`, 'error');
   } finally {
     runBtn.classList.remove('busy');
     runBtn.disabled = false;
@@ -570,8 +602,8 @@ runBtn.addEventListener('click', async () => {
   }
 });
 
-// ── Render results ────────────────────────────────────────────────────────────
-function renderResults({ stats, recommendations, owl_file_b64 }) {
+// ── Render results (stats + recommendations, called when 'done' event arrives)
+function renderResults({ stats, recommendations }) {
   // Stats grid
   const grid = document.getElementById('stats-grid');
   const items = [
@@ -586,14 +618,11 @@ function renderResults({ stats, recommendations, owl_file_b64 }) {
     `<div class="stat"><div class="stat-n">${stats[k] ?? 0}</div><div class="stat-l">${l}</div></div>`
   ).join('');
 
-  // OWL download
-  const owlBytes = atob(owl_file_b64);
-  const owlArr = new Uint8Array(owlBytes.length);
-  for (let i = 0; i < owlBytes.length; i++) owlArr[i] = owlBytes.charCodeAt(i);
-  const owlBlob = new Blob([owlArr], { type: 'application/rdf+xml' });
+  // OWL download button — disabled until file chunks arrive
   const dlOwl = document.getElementById('dl-owl');
-  dlOwl.href = URL.createObjectURL(owlBlob);
-  dlOwl.download = owlFilename;
+  dlOwl.style.opacity = '0.4';
+  dlOwl.style.pointerEvents = 'none';
+  dlOwl.textContent = '⏳ Receiving .owl file…';
 
   // JSON download
   const recJson = JSON.stringify(recommendations, null, 2);
@@ -629,6 +658,20 @@ function renderResults({ stats, recommendations, owl_file_b64 }) {
 
   document.getElementById('results-card').classList.add('show');
   document.getElementById('results-card').scrollIntoView({ behavior: 'smooth' });
+}
+
+// ── Enable OWL download once all chunks received
+function setOwlDownload(owl_file_b64) {
+  const owlBytes = atob(owl_file_b64);
+  const owlArr = new Uint8Array(owlBytes.length);
+  for (let i = 0; i < owlBytes.length; i++) owlArr[i] = owlBytes.charCodeAt(i);
+  const owlBlob = new Blob([owlArr], { type: 'application/rdf+xml' });
+  const dlOwl = document.getElementById('dl-owl');
+  dlOwl.href = URL.createObjectURL(owlBlob);
+  dlOwl.download = owlFilename;
+  dlOwl.style.opacity = '';
+  dlOwl.style.pointerEvents = '';
+  dlOwl.innerHTML = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1v8M4 6l3 3 3-3M2 11h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg> Download updated .owl`;
 }
 </script>
 </body>
